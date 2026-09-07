@@ -1,241 +1,101 @@
-# Oriented YOLOX - Rotated Object Detection
+# Production Oriented YOLOX
 
-This is an implementation of **Oriented YOLOX** for rotated object detection, extending the original YOLOX architecture to support arbitrary object orientations. Built on top of [Megvii-BaseDetection/YOLOX](https://github.com/Megvii-BaseDetection/YOLOX).
+This repository implements the production core for oriented object detection on
+top of [Megvii YOLOX](https://github.com/Megvii-BaseDetection/YOLOX), pinned to
+commit [`6ddff4824372906469a7fae2dc3206c7aa4bbaee`](https://github.com/Megvii-BaseDetection/YOLOX/commit/6ddff4824372906469a7fae2dc3206c7aa4bbaee).
 
-## Features
+Implemented functionality:
 
-✅ **Oriented Bounding Boxes**: Predicts (x, y, w, h, θ) for rotated objects  
-✅ **COCO Format Support**: Works with standard COCO JSON + images  
-✅ **Custom Classes**: Optimized for Bird Shed detection (Vehicles, Persons, Sticks, Spray Machines, Feed Machines)  
-✅ **Rotated NMS**: Handles overlapping rotated boxes correctly  
-✅ **Backward Compatible**: Still detects horizontal objects (θ = 0°)  
-✅ **Multiple Model Sizes**: Support for nano, tiny, small, medium, large, and x variants  
+- oriented COCO loading with mandatory rotated geometry;
+- canonical boxes `[cx, cy, w, h, angle_deg]`, with angles in `[0, 180)`;
+- an angle branch added without changing upstream regression parameter shapes;
+- transformed Gaussian KLD regression and orientation-aware SimOTA assignment;
+- exact rotated IoU and class-aware or class-agnostic NMS using OpenCV;
+- rotated AP50, rotated AP50:95, matched angle MAE, per-class AP, and timing;
+- oriented image, video, and webcam demo output.
 
-## Key Changes from Standard YOLOX
-
-1. **Head Output**: Changed from `[x, y, w, h, obj_conf, class_probs]` to `[x, y, w, h, θ, obj_conf, class_probs]`
-2. **Loss Function**: Added angle regression loss (smooth L1)
-3. **NMS**: Implemented Rotated NMS using oriented box IoU
-4. **Data Loading**: COCO dataset loader with angle extraction
-5. **Inference**: Post-processing with angle handling
+The scope is the production detection core. It does not implement the three
+paper enhancement modules; results that depend on those modules are outside
+this repository's claims.
 
 ## Installation
 
 ```bash
-git clone https://github.com/TanishkNava/YOLOX-Oriented.git
-cd YOLOX-Oriented
 pip install -e .
 ```
 
-## Dataset Preparation
+## Dataset contract
 
-Your COCO JSON format should include angle in bbox:
+Use normal COCO `images`, `annotations`, and `categories`. Every non-crowd
+annotation must contain exactly one of:
 
 ```json
-{
-  "images": [...],
-  "annotations": [
-    {
-      "id": 1,
-      "image_id": 1,
-      "category_id": 1,
-      "bbox": [x, y, w, h],
-      "angle": 45.0,
-      "iscrowd": 0
-    }
-  ],
-  "categories": [
-    {"id": 1, "name": "vehicle"},
-    {"id": 2, "name": "person"},
-    {"id": 3, "name": "stick"},
-    {"id": 4, "name": "spray_machine"},
-    {"id": 5, "name": "feed_machine"}
-  ]
-}
+{"rbbox": [cx, cy, w, h, angle_deg]}
 ```
 
-**Note**: If your COCO doesn't have angles yet, see [scripts/add_angles_to_coco.py](scripts/add_angles_to_coco.py) to add them.
+```json
+{"segmentation": [[x1, y1, x2, y2, x3, y3, x4, y4]]}
+```
 
-## Quick Start
+The flat eight-number segmentation form is also accepted. Polygon input is
+converted with `cv2.minAreaRect`. Width and height must be positive, all values
+must be finite, and angles are canonicalized modulo 180 to `[0, 180)`. Missing
+or malformed oriented geometry raises `ValueError`; it is never treated as
+zero degrees. See [docs/DATASET_PREPARATION.md](docs/DATASET_PREPARATION.md).
 
-### 1. Prepare Dataset
+## Layouts
+
+- Dataset raw row: `[cx, cy, w, h, angle_deg, class]`
+- Training target: `[class, cx, cy, w, h, angle_deg]`
+- Decoded head output: `[cx, cy, w, h, angle_deg, obj_conf, class_probs...]`
+- Post-NMS detection: `[cx, cy, w, h, angle_deg, obj_conf, class_conf, class_id]`
+- Public `format_oriented_detections` row: `[cx, cy, w, h, angle_deg, score, class_id]`
+- `--output-json` detection: `{cx, cy, w, h, angle, score, class_id}`
+
+## Train, evaluate, and run the demo
+
+Configure dataset paths, annotation names, and `num_classes` in
+`exps/custom/yolox_s_oriented.py` or a derived experiment.
 
 ```bash
-export YOLOX_DATADIR=/path/to/your/datasets
-ln -s /path/to/your/data ./datasets/BirdShed
+python tools/train.py \
+  -f exps/custom/yolox_s_oriented.py \
+  -d 1 -b 32 --fp16
 ```
-
-### 2. Create Config
 
 ```bash
-cp exps/default/yolox_s.py exps/custom/yolox_s_oriented_birdShed.py
-# Edit the config (see exps/custom/README.md)
+python tools/eval.py \
+  -f exps/custom/yolox_s_oriented.py \
+  -c YOLOX_outputs/yolox_s_oriented/best_ckpt.pth \
+  -d 1 -b 32
 ```
-
-### 3. Train
-
-```bash
-python -m yolox.tools.train \
-  -f exps/custom/yolox_s_oriented_birdShed.py \
-  -d 1 -b 32 --fp16 -o
-```
-
-### 4. Evaluate
-
-```bash
-python -m yolox.tools.eval \
-  -f exps/custom/yolox_s_oriented_birdShed.py \
-  -c checkpoints/yolox_s_oriented.pth \
-  -b 32 -d 1
-```
-
-### 5. Inference
 
 ```bash
 python tools/demo.py image \
-  -f exps/custom/yolox_s_oriented_birdShed.py \
-  -c checkpoints/yolox_s_oriented.pth \
+  -f exps/custom/yolox_s_oriented.py \
+  -c YOLOX_outputs/yolox_s_oriented/best_ckpt.pth \
   --path /path/to/image.jpg \
-  --conf 0.25 --save_result
+  --device gpu --conf 0.25 --nms 0.45 \
+  --save_result --output-json
 ```
 
-## Will It Detect Horizontal Objects?
+`--output-json` writes one JSON object per image or frame to stdout. Coordinates
+are restored to the original image scale.
 
-**YES!** ✅ Oriented YOLOX handles both horizontal AND rotated objects:
+## Pretrained weights
 
-- **Horizontal objects** → Angle = 0° (or 180°)
-- **Rotated objects** → Angle = θ (learned from data)
-- The model naturally learns to predict 0° for axis-aligned boxes
-- **No performance loss** on horizontal objects; often **better** since model has more flexibility
+For fine-tuning, `tools/train.py -c <standard-yolox-checkpoint>` loads matching
+keys and leaves the new `angle_preds` layers randomly initialized. This is the
+expected compatibility path. Resume, evaluation, and demo use strict model
+loading and therefore require an oriented checkpoint with matching classes and
+architecture; a standard YOLOX checkpoint cannot be used directly there.
 
-## Architecture Overview
+## Evaluation
 
-```
-Input Image
-    ↓
-  Backbone (CSPDarknet)
-    ↓
-  Neck (FPN)
-    ↓
-  Head (Decoupled)
-    ├─→ Regression Branch: [x, y, w, h, θ]  ← NEW: Angle prediction
-    ├─→ Objectness Branch: [obj_conf]
-    └─→ Classification Branch: [class_probs]
-    ↓
-Decoder (Preprocessing)
-    ↓
-Rotated NMS
-    ↓
-Detections [(x, y, w, h, θ, conf, class_id), ...]
-```
-
-## File Structure
-
-```
-YOLOX-Oriented/
-├── yolox/
-│   ├── models/
-│   │   ├── yolox.py               # Base model
-│   │   ├── yolo_head_oriented.py  # Modified head for angle
-│   │   └── darknet.py
-│   ├── utils/
-│   │   ├── rotated_nms.py         # Rotated NMS implementation
-│   │   └── boxes.py               # Box operations (oriented)
-│   ├── data/
-│   │   ├── datasets/
-│   │   │   └── coco_oriented.py   # COCO loader with angles
-│   │   └── data_augment.py
-│   └── tools/
-│       ├── train.py
-│       ├── eval.py
-│       └── demo.py
-├── exps/
-│   ├── default/
-│   │   └── yolox_s.py            # Base config
-│   └── custom/
-│       └── yolox_s_oriented_birdShed.py  # Your custom config
-├── scripts/
-│   ├── add_angles_to_coco.py      # Convert normal COCO to oriented COCO
-│   ├── visualize_oriented_boxes.py # Visualize rotated bboxes
-│   └── convert_dataset.py          # Dataset format conversion
-└── README.md
-```
-
-## Key Implementation Details
-
-### 1. Angle Representation
-- **Range**: [0°, 180°) (symmetric representation)
-- **Why**: Avoids 0° = 360° ambiguity; more stable for training
-- **Loss**: Smooth L1 Loss on angle differences
-
-### 2. Rotated NMS
-- Uses **Oriented IoU** (IoU of rotated boxes)
-- Handles arbitrary orientations correctly
-- Applied after confidence filtering and NMS
-
-### 3. Head Modification
-```python
-# Standard YOLOX:
-outputs = [cls, obj, reg]  # reg = [x, y, w, h]
-
-# Oriented YOLOX:
-outputs = [cls, obj, reg]  # reg = [x, y, w, h, angle]
-```
-
-## Training Tips
-
-1. **Learning Rate**: Start with base LR = 0.01, warmup for first 5 epochs
-2. **Augmentation**: Enable random rotation, flip, mosaic
-3. **Batch Size**: 32-64 per GPU (depends on image size)
-4. **Epochs**: 300-500 for good convergence
-5. **Weight Initialization**: Pretrain on standard YOLOX first, then fine-tune
-6. **Angle Loss Weight**: Usually 1.0 (same as other regression losses)
-
-## Evaluation Metrics
-
-- **mAP@0.5:0.95**: Mean Average Precision with standard IoU threshold
-- **mAP@0.5**: Coarse localization evaluation
-- **Angle MAE**: Mean Absolute Error for angle predictions
-- **Speed**: Inference time (ms/image)
-
-## Troubleshooting
-
-### High Loss on Angles
-- Normalize angles to [0, 180) range
-- Check if angle ground truth is correct
-- Use smaller learning rate for angle branch
-
-### Poor Detection Performance
-- Verify dataset format matches COCO schema
-- Check if angles are in correct range
-- Visualize training data with `scripts/visualize_oriented_boxes.py`
-
-### CUDA Out of Memory
-- Reduce batch size (-b flag)
-- Enable cache=False in config
-- Use smaller model (nano/tiny)
-
-## References
-
-1. YOLOX: [https://arxiv.org/abs/2107.08430](https://arxiv.org/abs/2107.08430)
-2. Oriented Object Detection: [https://arxiv.org/abs/2108.05699](https://arxiv.org/abs/2108.05699)
-3. Rotated IoU: [https://arxiv.org/abs/2105.05396](https://arxiv.org/abs/2105.05396)
-
-## Citation
-
-```bibtex
-@article{yolox2021,
-  title={YOLOX: Exceeding YOLO Series in 2021},
-  author={Ge, Zheng and Liu, Songtao and Wang, Feng and Li, Zeming and Sun, Jian},
-  journal={arXiv preprint arXiv:2107.08430},
-  year={2021}
-}
-```
+Evaluation matches detections with exact OpenCV rotated IoU. It reports rotated
+AP50, rotated AP50:95 over thresholds 0.50 through 0.95, matched angle MAE at
+IoU 0.50, optional per-class rotated AP50:95, and forward/NMS timing.
 
 ## License
 
-Apache License 2.0 (same as original YOLOX)
-
-## Contact
-
-For questions, issues, or contributions, please open an issue on GitHub.
+Apache License 2.0, following upstream YOLOX.

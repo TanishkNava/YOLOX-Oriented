@@ -1,299 +1,132 @@
-# Dataset Preparation for Oriented YOLOX
+# Dataset Preparation
 
-## Converting Standard COCO to Oriented COCO
+Production Oriented YOLOX uses COCO JSON with mandatory oriented geometry for
+every non-crowd annotation. It does not infer a missing angle from an
+axis-aligned `bbox` and does not default a missing angle to zero.
 
-If your current COCO dataset doesn't have angle annotations, you need to add them.
+## Accepted annotation forms
 
-### Method 1: From Polygon Annotations (Recommended)
+Keep the normal COCO identifiers and metadata. Add one of the following forms.
 
-If you have polygon-style rotated annotations:
+Direct rotated box:
 
 ```json
 {
-  "annotations": [
-    {
-      "segmentation": [[x1, y1, x2, y2, x3, y3, x4, y4]],
-      "bbox": [x, y, w, h],
-      "category_id": 1
-    }
-  ]
+  "id": 1,
+  "image_id": 10,
+  "category_id": 3,
+  "bbox": [80, 60, 40, 20],
+  "rbbox": [100, 70, 40, 20, 35],
+  "area": 800,
+  "iscrowd": 0
 }
 ```
 
-Convert to oriented format:
+`rbbox` is exactly `[cx, cy, w, h, angle_deg]`.
 
-```python
-import json
-import cv2
-import numpy as np
+Four-point polygon:
 
-def polygon_to_rotated_box(polygon):
-    """
-    Convert polygon to rotated box (cx, cy, w, h, angle).
-    
-    Args:
-        polygon: list of [x1, y1, x2, y2, ..., x4, y4]
-        
-    Returns:
-        (cx, cy, w, h, angle)
-    """
-    points = np.array(polygon).reshape(-1, 2)
-    
-    # Use cv2.minAreaRect to get oriented bounding box
-    rect = cv2.minAreaRect(points.astype(np.float32))
-    
-    # rect = ((cx, cy), (w, h), angle)
-    (cx, cy), (w, h), angle = rect
-    
-    # Normalize angle to [0, 180)
-    if angle < 0:
-        angle += 180
-    if angle >= 180:
-        angle -= 180
-    
-    return cx, cy, w, h, angle
-
-def convert_coco_to_oriented(input_json, output_json):
-    """Convert COCO JSON to oriented COCO JSON."""
-    
-    with open(input_json, 'r') as f:
-        coco_data = json.load(f)
-    
-    # Add angle to each annotation
-    for ann in coco_data['annotations']:
-        if 'segmentation' in ann and len(ann['segmentation']) > 0:
-            # Use first polygon if multiple exist
-            polygon = ann['segmentation'][0]
-            cx, cy, w, h, angle = polygon_to_rotated_box(polygon)
-            ann['angle'] = float(angle)
-        else:
-            # No segmentation, assume 0° (horizontal)
-            ann['angle'] = 0.0
-    
-    with open(output_json, 'w') as f:
-        json.dump(coco_data, f)
-    
-    print(f"Converted COCO annotations saved to {output_json}")
-
-# Usage
-convert_coco_to_oriented('instances_train2017.json', 'instances_train2017_oriented.json')
+```json
+{
+  "id": 2,
+  "image_id": 10,
+  "category_id": 3,
+  "bbox": [80, 60, 40, 20],
+  "segmentation": [[82, 64, 115, 55, 120, 76, 87, 85]],
+  "area": 800,
+  "iscrowd": 0
+}
 ```
 
-### Method 2: Manual Annotation with Angle
+The loader accepts either one nested eight-number polygon, as above, or a flat
+eight-number list:
 
-Use annotation tools that support angle:
-1. **LabelImg with rotation support**
-2. **CVAT (Computer Vision Annotation Tool)**
-3. **Supervisely**
-
-Make sure your export includes angle field.
-
-### Method 3: Programmatic Annotation
-
-If you know object orientations from metadata:
-
-```python
-def add_angles_from_metadata(coco_json, metadata_file, output_json):
-    """
-    Add angles from external metadata file.
-    
-    Metadata format: {"image_id": {"object_id": angle_degrees}}
-    """
-    with open(coco_json, 'r') as f:
-        coco = json.load(f)
-    
-    with open(metadata_file, 'r') as f:
-        metadata = json.load(f)
-    
-    for ann in coco['annotations']:
-        img_id = str(ann['image_id'])
-        obj_id = str(ann['id'])
-        
-        if img_id in metadata and obj_id in metadata[img_id]:
-            ann['angle'] = metadata[img_id][obj_id]
-        else:
-            ann['angle'] = 0.0  # Default to horizontal
-    
-    with open(output_json, 'w') as f:
-        json.dump(coco, f)
+```json
+{"segmentation": [x1, y1, x2, y2, x3, y3, x4, y4]}
 ```
 
-## Validation Checklist
+No other polygon length or multiple-polygon segmentation is accepted. Polygon
+points are converted with `cv2.minAreaRect`.
 
-Before training, verify your dataset:
+## Angle and geometry rules
 
-```python
-import json
-import cv2
-import numpy as np
-from pathlib import Path
+- The internal format is `[cx, cy, w, h, angle_deg]`.
+- Angles use OpenCV rotated-rectangle orientation and are canonicalized modulo
+  180 to `[0, 180)`.
+- Width and height retain their corresponding axes; there is no long-edge
+  width convention.
+- Width and height must be positive.
+- Rotated-box values and polygon coordinates must be finite.
+- A polygon must have positive area.
+- Missing or malformed oriented geometry raises `ValueError` during dataset
+  initialization.
 
-def validate_oriented_coco(json_path, img_dir):
-    """Validate oriented COCO dataset."""
-    
-    with open(json_path) as f:
-        coco = json.load(f)
-    
-    print("🔍 Validating Oriented COCO Dataset...\n")
-    
-    # Check 1: Required fields
-    print("[1] Checking required fields...")
-    required_fields = ['images', 'annotations', 'categories']
-    for field in required_fields:
-        if field not in coco:
-            print(f"  ❌ Missing '{field}'")
-            return False
-        print(f"  ✓ '{field}' found ({len(coco[field])} items)")
-    
-    # Check 2: Annotations have angle
-    print("\n[2] Checking angle annotations...")
-    missing_angles = 0
-    angle_range = [float('inf'), float('-inf')]
-    
-    for ann in coco['annotations']:
-        if 'angle' not in ann:
-            missing_angles += 1
-            ann['angle'] = 0.0  # Add default
-        else:
-            angle = ann['angle']
-            angle_range[0] = min(angle_range[0], angle)
-            angle_range[1] = max(angle_range[1], angle)
-    
-    print(f"  Annotations with angle: {len(coco['annotations']) - missing_angles}")
-    if missing_angles > 0:
-        print(f"  ⚠ Missing angles (set to 0°): {missing_angles}")
-    print(f"  Angle range: [{angle_range[0]:.1f}°, {angle_range[1]:.1f}°]")
-    
-    # Check 3: Image files exist
-    print("\n[3] Checking image files...")
-    missing_images = []
-    for img in coco['images']:
-        img_path = Path(img_dir) / img['file_name']
-        if not img_path.exists():
-            missing_images.append(img['file_name'])
-    
-    if missing_images:
-        print(f"  ❌ Missing images: {len(missing_images)}")
-        for f in missing_images[:5]:
-            print(f"    - {f}")
-    else:
-        print(f"  ✓ All {len(coco['images'])} image files found")
-    
-    # Check 4: Annotation validity
-    print("\n[4] Checking annotation validity...")
-    invalid_anns = 0
-    
-    for ann in coco['annotations']:
-        # Check bbox
-        if 'bbox' not in ann or len(ann['bbox']) != 4:
-            invalid_anns += 1
-            continue
-        
-        x, y, w, h = ann['bbox']
-        if w <= 0 or h <= 0:
-            invalid_anns += 1
-            continue
-        
-        # Check angle range
-        angle = ann.get('angle', 0.0)
-        if not (0 <= angle < 180):
-            ann['angle'] = angle % 180  # Normalize
-    
-    print(f"  Valid annotations: {len(coco['annotations']) - invalid_anns}")
-    if invalid_anns > 0:
-        print(f"  ⚠ Invalid annotations: {invalid_anns}")
-    
-    print("\n✅ Validation complete!")
-    return True
+An axis-aligned object still needs an explicit orientation, for example:
 
-# Usage
-validate_oriented_coco(
-    'datasets/BirdShed/annotations/instances_train2017.json',
-    'datasets/BirdShed/train2017'
-)
+```json
+{"rbbox": [100, 70, 40, 20, 0]}
 ```
 
-## Dataset Statistics
+Do not add `angle` beside a four-number COCO `bbox`; that is not the training
+loader's oriented annotation contract.
 
-After preparation, generate statistics:
+## Directory structure
 
-```python
-def dataset_statistics(json_path):
-    """Generate dataset statistics."""
-    with open(json_path) as f:
-        coco = json.load(f)
-    
-    print("📊 Dataset Statistics\n")
-    print(f"Images: {len(coco['images'])}")
-    print(f"Annotations: {len(coco['annotations'])}")
-    print(f"Classes: {len(coco['categories'])}")
-    
-    # Distribution by class
-    print("\nClass Distribution:")
-    class_counts = {}
-    for ann in coco['annotations']:
-        cat_id = ann['category_id']
-        class_counts[cat_id] = class_counts.get(cat_id, 0) + 1
-    
-    for cat in coco['categories']:
-        count = class_counts.get(cat['id'], 0)
-        pct = 100 * count / len(coco['annotations'])
-        print(f"  {cat['name']}: {count} ({pct:.1f}%)")
-    
-    # Angle distribution
-    angles = [ann.get('angle', 0) for ann in coco['annotations']]
-    print(f"\nAngle Statistics:")
-    print(f"  Min: {min(angles):.1f}°")
-    print(f"  Max: {max(angles):.1f}°")
-    print(f"  Mean: {np.mean(angles):.1f}°")
-    print(f"  Median: {np.median(angles):.1f}°")
+The default experiment names expect:
 
-from pathlib import Path
-import numpy as np
-
-dataset_statistics('datasets/BirdShed/annotations/instances_train2017.json')
-```
-
-## Expected Directory Structure
-
-```
-datasets/BirdShed/
+```text
+dataset/
+├── annotations/
+│   ├── instances_train2017.json
+│   └── instances_val2017.json
 ├── train2017/
-│   ├── image_001.jpg
-│   ├── image_002.jpg
 │   └── ...
-├── val2017/
-│   ├── image_100.jpg
-│   └── ...
-└── annotations/
-    ├── instances_train2017.json  # With 'angle' field
-    └── instances_val2017.json    # With 'angle' field
+└── val2017/
+    └── ...
 ```
 
-## Quick Start
+Configure `data_dir`, `train_ann`, `val_ann`, and `num_classes` in
+`exps/custom/yolox_s_oriented.py` or a derived experiment.
+
+## Validation checklist
+
+Before training, verify:
+
+1. `images`, `annotations`, and `categories` are valid COCO collections.
+2. Every non-crowd annotation has one valid `rbbox` or one valid four-point
+   `segmentation`.
+3. Category IDs in annotations exist in `categories`.
+4. Every referenced image exists under the configured split directory.
+5. Box sizes and polygon areas are positive and all coordinates are finite.
+6. The configured `num_classes` equals the number of trained categories.
+
+Run the standalone validator and inspect rendered samples:
 
 ```bash
-# 1. Prepare base COCO
-mkdir -p datasets/BirdShed/{train2017,val2017,annotations}
-cp /your/images/train/* datasets/BirdShed/train2017/
-cp /your/images/val/* datasets/BirdShed/val2017/
+python tools/validate_oriented_dataset.py \
+  /path/to/dataset/annotations/instances_train2017.json \
+  --images-dir /path/to/dataset/train2017
 
-# 2. Add angles to annotations
-python scripts/add_angles_to_coco.py \
-  --input instances_train2017.json \
-  --output datasets/BirdShed/annotations/instances_train2017.json \
-  --from_polygons  # or --from_metadata metadata.json
-
-# 3. Validate
-python scripts/validate_dataset.py \
-  --json datasets/BirdShed/annotations/instances_train2017.json \
-  --image_dir datasets/BirdShed/train2017
-
-# 4. Visualize
-python scripts/visualize_oriented_boxes.py \
-  --json datasets/BirdShed/annotations/instances_train2017.json \
-  --image_dir datasets/BirdShed/train2017 \
-  --num_samples 10
+python tools/visualize_oriented_dataset.py \
+  /path/to/dataset/annotations/instances_train2017.json \
+  --images-dir /path/to/dataset/train2017 \
+  --output-dir oriented_visualizations
 ```
 
-Done! Your dataset is ready for training. 🎉
+Dataset construction is also a strict format check:
+
+```bash
+python - <<'PY'
+from yolox.data import OrientedCOCODataset
+
+dataset = OrientedCOCODataset(
+    data_dir="/path/to/dataset",
+    json_file="instances_train2017.json",
+    name="train2017",
+)
+print("validated annotations:", len(dataset))
+PY
+```
+
+If this fails, correct the source annotation. Do not fill unknown orientations
+with zero unless zero degrees is the verified ground truth.
